@@ -16,6 +16,7 @@ import com.nononsenseapps.feeder.model.detectLocaleFromText
 import com.nononsenseapps.feeder.model.hasEnoughTextForLanguageDetection
 import com.nononsenseapps.feeder.model.prepareTextForLanguageDetection
 import com.nononsenseapps.feeder.openai.OpenAIApi.TranslationResult
+import com.nononsenseapps.feeder.util.FilePathProvider
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -26,14 +27,18 @@ import org.jsoup.nodes.TextNode
 import org.kodein.di.DI
 import org.kodein.di.DIAware
 import org.kodein.di.instance
-import java.util.Locale
 import java.util.concurrent.Executor
 
 class LocalTranslator(
     override val di: DI,
 ) : DIAware {
     private val application: Application by instance()
+    private val filePathProvider: FilePathProvider by instance()
     private val directExecutor = Executor { runnable -> runnable.run() }
+    private val bergamotModelManager by lazy {
+        BergamotModelManager(filePathProvider.filesDir.resolve("translation-models").resolve("bergamot"))
+    }
+    private val bergamotWebTranslator by lazy { BergamotWebTranslator(application) }
 
     suspend fun translate(
         content: String,
@@ -42,12 +47,6 @@ class LocalTranslator(
         preserveHtml: Boolean = false,
     ): TranslationResult =
         withContext(Dispatchers.IO) {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-                return@withContext TranslationResult.Error(
-                    content = "Local translation requires Android 12 or newer.",
-                )
-            }
-
             val text = prepareTextForLanguageDetection(content, preserveHtml)
             if (text.isBlank()) {
                 return@withContext TranslationResult.Success(
@@ -66,23 +65,46 @@ class LocalTranslator(
                 )
             }
 
-            if (preserveHtml) {
-                translateHtml(
+            val androidSystemResult =
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    if (preserveHtml) {
+                        translateHtmlWithAndroidSystem(
+                            html = content,
+                            sourceLang = sourceLang,
+                            targetLang = targetLang,
+                        )
+                    } else {
+                        translatePlainTextWithAndroidSystem(
+                            content = content,
+                            sourceLang = sourceLang,
+                            targetLang = targetLang,
+                        )
+                    }
+                } else {
+                    TranslationResult.Error("Android system on-device translation requires Android 12 or newer.")
+                }
+
+            if (androidSystemResult is TranslationResult.Success) {
+                androidSystemResult
+            } else if (preserveHtml) {
+                translateHtmlWithBergamot(
                     html = content,
                     sourceLang = sourceLang,
                     targetLang = targetLang,
+                    androidSystemError = androidSystemResult.content,
                 )
             } else {
-                translatePlainText(
+                translatePlainTextWithBergamot(
                     content = content,
                     sourceLang = sourceLang,
                     targetLang = targetLang,
+                    androidSystemError = androidSystemResult.content,
                 )
             }
         }
 
     @RequiresApi(Build.VERSION_CODES.S)
-    private suspend fun translateHtml(
+    private suspend fun translateHtmlWithAndroidSystem(
         html: String,
         sourceLang: String,
         targetLang: String,
@@ -128,7 +150,7 @@ class LocalTranslator(
     }
 
     @RequiresApi(Build.VERSION_CODES.S)
-    private suspend fun translatePlainText(
+    private suspend fun translatePlainTextWithAndroidSystem(
         content: String,
         sourceLang: String,
         targetLang: String,
@@ -149,6 +171,131 @@ class LocalTranslator(
 
             is LocalTranslationResult.Error -> TranslationResult.Error(result.message)
         }
+
+    private suspend fun translateHtmlWithBergamot(
+        html: String,
+        sourceLang: String,
+        targetLang: String,
+        androidSystemError: String,
+    ): TranslationResult {
+        val document = Jsoup.parseBodyFragment(html)
+        val translationTargets =
+            document
+                .body()
+                .let(::collectTextNodes)
+                .mapNotNull { textNode ->
+                    HtmlTextNodeTranslation
+                        .from(textNode)
+                        .takeIf { hasEnoughTextForLanguageDetection(it.text) }
+                }
+
+        if (translationTargets.isEmpty()) {
+            return TranslationResult.Success(
+                content = html,
+                detectedLanguage = sourceLang,
+            )
+        }
+
+        val translatedTexts =
+            translateTextValuesWithBergamot(
+                content = translationTargets.map(HtmlTextNodeTranslation::text),
+                sourceLang = sourceLang,
+                targetLang = targetLang,
+                preserveHtml = false,
+                androidSystemError = androidSystemError,
+            )
+
+        return when (translatedTexts) {
+            is LocalTranslationResult.Success -> {
+                translationTargets.zip(translatedTexts.values).forEach { (target, translatedText) ->
+                    target.textNode.text(target.leadingWhitespace + translatedText + target.trailingWhitespace)
+                }
+                TranslationResult.Success(
+                    content = document.body().html(),
+                    detectedLanguage = sourceLang,
+                )
+            }
+
+            is LocalTranslationResult.Error -> TranslationResult.Error(translatedTexts.message)
+        }
+    }
+
+    private suspend fun translatePlainTextWithBergamot(
+        content: String,
+        sourceLang: String,
+        targetLang: String,
+        androidSystemError: String,
+    ): TranslationResult =
+        when (
+            val result =
+                translateTextValuesWithBergamot(
+                    content = listOf(content),
+                    sourceLang = sourceLang,
+                    targetLang = targetLang,
+                    preserveHtml = false,
+                    androidSystemError = androidSystemError,
+                )
+        ) {
+            is LocalTranslationResult.Success ->
+                TranslationResult.Success(
+                    content = result.values.firstOrNull().orEmpty(),
+                    detectedLanguage = sourceLang,
+                )
+
+            is LocalTranslationResult.Error -> TranslationResult.Error(result.message)
+        }
+
+    private suspend fun translateTextValuesWithBergamot(
+        content: List<String>,
+        sourceLang: String,
+        targetLang: String,
+        preserveHtml: Boolean,
+        androidSystemError: String,
+    ): LocalTranslationResult {
+        val preparation =
+            bergamotModelManager.prepare(
+                sourceLanguage = sourceLang,
+                targetLanguage = targetLang,
+            )
+
+        val modelRegistry =
+            when (preparation) {
+                is BergamotModelPreparation.Ready -> preparation.modelRegistry
+                is BergamotModelPreparation.Error ->
+                    return LocalTranslationResult.Error(
+                        listOf(
+                            "Android system translation unavailable: ${androidSystemError.ifBlank { "no on-device translator was available" }}",
+                            preparation.message,
+                            "App model storage: ${bergamotModelManager.storageLocation().absolutePath}",
+                        ).joinToString(separator = "\n"),
+                    )
+            }
+
+        return try {
+            when (
+                val result =
+                    bergamotWebTranslator.translate(
+                        content = content,
+                        sourceLanguage = sourceLang,
+                        targetLanguage = targetLang,
+                        preserveHtml = preserveHtml,
+                        modelRegistry = modelRegistry,
+                    )
+            ) {
+                is BergamotWebTranslationResult.Success -> LocalTranslationResult.Success(result.values)
+                is BergamotWebTranslationResult.Error ->
+                    LocalTranslationResult.Error(
+                        "Android system translation unavailable: ${androidSystemError.ifBlank { "no on-device translator was available" }}\n" +
+                            "Feeder's app-provided Bergamot model failed: ${result.message}",
+                    )
+            }
+        } catch (e: Exception) {
+            LocalTranslationResult.Error(
+                "Android system translation unavailable: ${androidSystemError.ifBlank { "no on-device translator was available" }}\n" +
+                    "Feeder's app-provided Bergamot model failed: ${e.message ?: "unknown error"}",
+            )
+        }
+    }
 
     @RequiresApi(Build.VERSION_CODES.S)
     private suspend fun translateTextValues(
@@ -281,35 +428,6 @@ class LocalTranslator(
                 ?.language
                 ?: "en"
         }.getOrDefault("en")
-
-    private fun normalizeLanguageCode(language: String): String {
-        val normalized =
-            language
-                .trim()
-                .lowercase(Locale.ROOT)
-                .replace('_', '-')
-                .substringBefore('-')
-
-        return when (normalized) {
-            "english", "en" -> "en"
-            "german", "de" -> "de"
-            "french", "fr" -> "fr"
-            "spanish", "es" -> "es"
-            "portuguese", "pt" -> "pt"
-            "italian", "it" -> "it"
-            "dutch", "nl" -> "nl"
-            "polish", "pl" -> "pl"
-            "russian", "ru" -> "ru"
-            "czech", "cs" -> "cs"
-            "estonian", "et" -> "et"
-            "bulgarian", "bg" -> "bg"
-            "icelandic", "is" -> "is"
-            "norwegian", "nb", "nn" -> "nb"
-            "persian", "fa" -> "fa"
-            "ukrainian", "uk" -> "uk"
-            else -> normalized
-        }
-    }
 
     companion object {
         private const val TRANSLATION_TIMEOUT_MS = 60_000L
